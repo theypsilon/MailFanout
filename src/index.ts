@@ -30,6 +30,7 @@ export default {
         outcome,
         scannedCount: result.scanned,
         processedSkippedCount: result.processedSkipped,
+        staleFilteredDiscoveredCount: result.staleFilteredDiscovered,
         selectedCount: result.selected,
         evaluatedCount: result.evaluated,
         matchedCount: result.matched,

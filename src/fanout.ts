@@ -1,7 +1,9 @@
 import { loadConfig, type FanoutConfig } from "./config";
 import {
-  messageContainsRequiredContent,
+  FILTER_RULE_VERSION,
+  findRequiredContentMatch,
   REQUIRED_CONTENT,
+  type RequiredContentMatch,
 } from "./content-filter";
 import {
   getAuthenticatedAddress,
@@ -28,7 +30,8 @@ import type { Env, KVNamespace } from "./types";
 
 const PROCESSED_KEY_PREFIX = "processed:";
 const FORWARDED_MARKER = "1";
-const FILTERED_MARKER = "0";
+const LEGACY_BODY_ONLY_FILTERED_MARKER = "0";
+const FILTERED_MARKER = `f${FILTER_RULE_VERSION}`;
 const DAILY_USAGE_KEY_PREFIX = "deliveries:";
 const INBOX_CURSOR_KEY = "state:inbox-cursor";
 const INBOX_CURSOR_START = "-";
@@ -39,12 +42,14 @@ interface CandidateSearchResult {
   readonly messages: GmailMessageReference[];
   readonly scanned: number;
   readonly processedSkipped: number;
+  readonly staleFilteredDiscovered: number;
   readonly cursorToSave?: string;
 }
 
 export interface FanoutResult {
   readonly scanned: number;
   readonly processedSkipped: number;
+  readonly staleFilteredDiscovered: number;
   readonly selected: number;
   readonly evaluated: number;
   readonly matched: number;
@@ -124,6 +129,7 @@ async function findUnprocessedMessages(
   const seen = new Set<string>();
   let scanned = 0;
   let processedSkipped = 0;
+  let staleFilteredDiscovered = 0;
 
   const unprocessedIn = async (
     pageMessages: GmailMessageReference[],
@@ -145,7 +151,14 @@ async function findUnprocessedMessages(
       seen.add(message.id);
 
       const marker = markers.get(processedKey(message.id));
-      if (marker === null || marker === undefined) {
+      if (
+        marker === null ||
+        marker === undefined ||
+        marker === LEGACY_BODY_ONLY_FILTERED_MARKER
+      ) {
+        if (marker === LEGACY_BODY_ONLY_FILTERED_MARKER) {
+          staleFilteredDiscovered += 1;
+        }
         unprocessed.push(message);
       } else {
         processedSkipped += 1;
@@ -170,7 +183,12 @@ async function findUnprocessedMessages(
   messages.push(...newestUnprocessed.slice(0, limit));
 
   if (messages.length === limit) {
-    return { messages, scanned, processedSkipped };
+    return {
+      messages,
+      scanned,
+      processedSkipped,
+      staleFilteredDiscovered,
+    };
   }
 
   let pageToken = storedCursor ?? firstPage.nextPageToken;
@@ -231,7 +249,13 @@ async function findUnprocessedMessages(
     cursorToSave = INBOX_CURSOR_START;
   }
 
-  return { messages, scanned, processedSkipped, cursorToSave };
+  return {
+    messages,
+    scanned,
+    processedSkipped,
+    staleFilteredDiscovered,
+    cursorToSave,
+  };
 }
 
 function shouldStopAfter(error: unknown): boolean {
@@ -336,6 +360,7 @@ export async function runMailFanout(
   logInfo("inbox_scan_completed", logContext, {
     scannedCount: candidates.scanned,
     processedSkippedCount: candidates.processedSkipped,
+    staleFilteredDiscoveredCount: candidates.staleFilteredDiscovered,
     selectedCount: candidates.messages.length,
     scanLimit: config.maxInboxScanPerRun,
     selectionLimit: config.maxMessagesPerRun,
@@ -354,20 +379,21 @@ export async function runMailFanout(
     const messageStartedAt = Date.now();
     let processingStage = "message_content_download";
     let subject = "(unavailable)";
+    let matchSource: RequiredContentMatch | undefined;
     let sentMessageId: string | undefined;
 
     try {
       const payload = await getMessageContent(accessToken, message.id);
       subject = messageSubject(payload);
       processingStage = "content_filter";
-      const shouldForward = await messageContainsRequiredContent(
+      matchSource = await findRequiredContentMatch(
         accessToken,
         message.id,
         payload,
       );
       evaluated += 1;
 
-      if (!shouldForward) {
+      if (matchSource === undefined) {
         processingStage = "filtered_marker_write";
         await env.PROCESSED_EMAILS.put(
           processedKey(message.id),
@@ -396,6 +422,7 @@ export async function runMailFanout(
           subject,
           outcome: "deferred",
           reason: "daily_delivery_quota_exhausted",
+          matchSource,
           currentState: "unprocessed",
           markerStored: false,
           durationMs: elapsedMilliseconds(messageStartedAt),
@@ -417,6 +444,7 @@ export async function runMailFanout(
         messageId: message.id,
         subject,
         recipientCount: config.recipients.length,
+        matchSource,
         currentState: "unprocessed",
       });
       sentMessageId = await sendRawMessage(accessToken, outgoing);
@@ -437,6 +465,7 @@ export async function runMailFanout(
         nextState: "forwarded",
         markerStored: true,
         recipientCount: config.recipients.length,
+        matchSource,
         durationMs: elapsedMilliseconds(messageStartedAt),
       });
     } catch (error) {
@@ -462,6 +491,7 @@ export async function runMailFanout(
           retryExpected: true,
           duplicateRisk: sentWithoutMarker,
           stopsRun,
+          matchSource,
           gmailStatus:
             error instanceof GmailApiError ? error.status : undefined,
           durationMs: elapsedMilliseconds(messageStartedAt),
@@ -501,6 +531,7 @@ export async function runMailFanout(
   return {
     scanned: candidates.scanned,
     processedSkipped: candidates.processedSkipped,
+    staleFilteredDiscovered: candidates.staleFilteredDiscovered,
     selected: candidates.messages.length,
     evaluated,
     matched,

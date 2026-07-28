@@ -5,7 +5,22 @@ import {
 import { MessageFormatError } from "./message";
 
 export const REQUIRED_CONTENT = "github.com";
+export const FILTER_RULE_VERSION = 2;
 const UTF8_DECODER = new TextDecoder();
+
+export type RequiredContentMatch = "subject" | "body";
+
+function subjectContainsRequiredContent(
+  payload: GmailMessagePart,
+): boolean {
+  const subject = payload.headers?.find(
+    (header) => header.name?.toLowerCase() === "subject",
+  )?.value;
+
+  return (
+    subject?.toLowerCase().includes(REQUIRED_CONTENT) ?? false
+  );
+}
 
 function decodeBase64Url(value: string): Uint8Array {
   const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
@@ -71,10 +86,20 @@ async function partContainsRequiredContent(
     .includes(REQUIRED_CONTENT);
 }
 
-export async function messageContainsRequiredContent(
+export async function findRequiredContentMatch(
   accessToken: string,
   messageId: string,
   payload: GmailMessagePart,
-): Promise<boolean> {
-  return partContainsRequiredContent(accessToken, messageId, payload);
+): Promise<RequiredContentMatch | undefined> {
+  if (subjectContainsRequiredContent(payload)) {
+    return "subject";
+  }
+
+  return (await partContainsRequiredContent(
+    accessToken,
+    messageId,
+    payload,
+  ))
+    ? "body"
+    : undefined;
 }
