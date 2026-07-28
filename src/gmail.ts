@@ -17,6 +17,21 @@ export interface GmailMessagePage {
   readonly nextPageToken?: string;
 }
 
+export interface GmailMessagePart {
+  readonly mimeType?: string;
+  readonly filename?: string;
+  readonly headers?: {
+    readonly name?: string;
+    readonly value?: string;
+  }[];
+  readonly body?: {
+    readonly attachmentId?: string;
+    readonly data?: string;
+    readonly size?: number;
+  };
+  readonly parts?: GmailMessagePart[];
+}
+
 interface TokenResponse {
   readonly access_token?: string;
   readonly error?: string;
@@ -26,6 +41,15 @@ interface TokenResponse {
 interface RawMessageResponse {
   readonly id?: string;
   readonly raw?: string;
+}
+
+interface FullMessageResponse {
+  readonly id?: string;
+  readonly payload?: GmailMessagePart;
+}
+
+interface AttachmentResponse {
+  readonly data?: string;
 }
 
 interface SentMessageResponse {
@@ -178,6 +202,45 @@ export async function getRawMessage(
   }
 
   return result.raw;
+}
+
+export async function getMessageContent(
+  accessToken: string,
+  messageId: string,
+): Promise<GmailMessagePart> {
+  const result = await gmailRequest<FullMessageResponse>(
+    accessToken,
+    "message content download",
+    `${GMAIL_API_BASE}/messages/${encodeURIComponent(messageId)}?format=full`,
+  );
+
+  if (result.payload === undefined) {
+    throw new Error(`Gmail message ${messageId} did not contain a payload`);
+  }
+
+  return result.payload;
+}
+
+export async function getMessageAttachment(
+  accessToken: string,
+  messageId: string,
+  attachmentId: string,
+): Promise<string> {
+  const result = await gmailRequest<AttachmentResponse>(
+    accessToken,
+    "message attachment download",
+    `${GMAIL_API_BASE}/messages/${encodeURIComponent(
+      messageId,
+    )}/attachments/${encodeURIComponent(attachmentId)}`,
+  );
+
+  if (result.data === undefined) {
+    throw new Error(
+      `Gmail attachment ${attachmentId} did not contain data`,
+    );
+  }
+
+  return result.data;
 }
 
 export async function sendRawMessage(
