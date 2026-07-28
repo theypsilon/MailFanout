@@ -237,7 +237,6 @@ export function createForwardMessage(
 
   const headers = [
     `From: ${senderHeader(options.sender, replyTo)}`,
-    "To: undisclosed-recipients:;",
     `Bcc: ${options.recipients.join(",\r\n ")}`,
     ...(replyTo === undefined ? [] : [`Reply-To: ${replyTo}`]),
     `Subject: ${subjectHeader(originalSubject)}`,
