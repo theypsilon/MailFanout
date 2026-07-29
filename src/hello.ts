@@ -7,4 +7,3 @@ interface HelloWorldContext {
 export function helloWorld(context: HelloWorldContext): void {
   console.log("Hello, World!", context);
 }
-

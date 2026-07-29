@@ -21,7 +21,7 @@ function required(env: Env, name: keyof Env): string {
   const value = env[name];
 
   if (typeof value !== "string" || value.trim() === "") {
-    throw new Error(`Missing required Cloudflare variable or secret: ${name}`);
+    throw new Error(`Missing required variable or secret: ${name}`);
   }
 
   return value.trim();
@@ -72,7 +72,9 @@ export function loadConfig(env: Env): FanoutConfig {
   ];
 
   if (recipients.length === 0) {
-    throw new Error("FORWARD_RECIPIENTS must contain at least one email address");
+    throw new Error(
+      "FORWARD_RECIPIENTS must contain at least one email address",
+    );
   }
 
   const invalidRecipient = recipients.find(
@@ -95,9 +97,7 @@ export function loadConfig(env: Env): FanoutConfig {
       (address) => address.toLowerCase() === gmailAddress.toLowerCase(),
     )
   ) {
-    throw new Error(
-      "GMAIL_ADDRESS cannot also appear in FORWARD_RECIPIENTS",
-    );
+    throw new Error("GMAIL_ADDRESS cannot also appear in FORWARD_RECIPIENTS");
   }
 
   return {
@@ -109,13 +109,13 @@ export function loadConfig(env: Env): FanoutConfig {
     maxMessagesPerRun: integerSetting(
       env.MAX_MESSAGES_PER_RUN,
       "MAX_MESSAGES_PER_RUN",
-      5,
+      1,
       25,
     ),
     maxInboxScanPerRun: integerSetting(
       env.MAX_INBOX_SCAN_PER_RUN,
       "MAX_INBOX_SCAN_PER_RUN",
-      500,
+      250,
       5_000,
     ),
     maxRecipientDeliveriesPerDay: integerSetting(

@@ -1,4 +1,4 @@
-import { loadConfig, type FanoutConfig } from "./config";
+import { type FanoutConfig, loadConfig } from "./config";
 import {
   FILTER_RULE_VERSION,
   findRequiredContentMatch,
@@ -6,12 +6,16 @@ import {
   type RequiredContentMatch,
 } from "./content-filter";
 import {
+  GmailApiError,
+  GmailDeliveryUncertainError,
+  type GmailMessagePage,
+  type GmailMessagePart,
+  type GmailMessageReference,
+  GmailOAuthError,
+  type GmailRequestOptions,
   getAuthenticatedAddress,
   getMessageContent,
   getRawMessage,
-  GmailApiError,
-  type GmailMessagePart,
-  type GmailMessageReference,
   listInboxMessages,
   refreshAccessToken,
   sendRawMessage,
@@ -37,6 +41,13 @@ const INBOX_CURSOR_KEY = "state:inbox-cursor";
 const INBOX_CURSOR_START = "-";
 const DAILY_USAGE_TTL_SECONDS = 3 * 24 * 60 * 60;
 const KV_BULK_READ_LIMIT = 100;
+const FORWARDED_MARKER_MAX_ATTEMPTS = 8;
+const FORWARDED_MARKER_INITIAL_DELAY_MS = 1_000;
+const FORWARDED_MARKER_MAX_DELAY_MS = 30_000;
+const FORWARDED_MARKER_JITTER_RATIO = 0.25;
+const STATE_WRITE_MAX_ATTEMPTS = 4;
+const STATE_WRITE_INITIAL_DELAY_MS = 250;
+const STATE_WRITE_MAX_DELAY_MS = 2_000;
 
 interface CandidateSearchResult {
   readonly messages: GmailMessageReference[];
@@ -75,6 +86,20 @@ export class FanoutRunError extends Error {
   }
 }
 
+class ForwardedMarkerWriteError extends Error {
+  constructor(
+    readonly attempts: number,
+    readonly originalError: unknown,
+  ) {
+    super(
+      originalError instanceof Error
+        ? originalError.message
+        : "Unknown forwarded marker write error",
+    );
+    this.name = "ForwardedMarkerWriteError";
+  }
+}
+
 async function runStage<T>(
   stage: string,
   operation: () => Promise<T>,
@@ -96,6 +121,106 @@ function synchronousRunStage<T>(stage: string, operation: () => T): T {
 
 function processedKey(messageId: string): string {
   return `${PROCESSED_KEY_PREFIX}${messageId}`;
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function writeForwardedMarkerWithRetry(
+  kv: KVNamespace,
+  key: string,
+  logContext: LogContext,
+  messageId: string,
+  subject: string,
+): Promise<number> {
+  const startedAt = Date.now();
+
+  for (
+    let attempt = 1;
+    attempt <= FORWARDED_MARKER_MAX_ATTEMPTS;
+    attempt += 1
+  ) {
+    try {
+      await kv.put(key, FORWARDED_MARKER);
+
+      if (attempt > 1) {
+        logInfo("message_marker_write_recovered", logContext, {
+          messageId,
+          subject,
+          markerState: "forwarded",
+          attemptsUsed: attempt,
+          durationMs: elapsedMilliseconds(startedAt),
+        });
+      }
+
+      return attempt;
+    } catch (error) {
+      if (attempt === FORWARDED_MARKER_MAX_ATTEMPTS) {
+        throw new ForwardedMarkerWriteError(attempt, error);
+      }
+
+      const exponentialDelay = Math.min(
+        FORWARDED_MARKER_INITIAL_DELAY_MS * 2 ** (attempt - 1),
+        FORWARDED_MARKER_MAX_DELAY_MS,
+      );
+      const jitter = Math.floor(
+        Math.random() * exponentialDelay * FORWARDED_MARKER_JITTER_RATIO,
+      );
+      const retryDelayMs = exponentialDelay + jitter;
+
+      logWarning("message_marker_write_retry", logContext, {
+        messageId,
+        subject,
+        markerState: "forwarded",
+        failedAttempt: attempt,
+        nextAttempt: attempt + 1,
+        maxAttempts: FORWARDED_MARKER_MAX_ATTEMPTS,
+        retryDelayMs,
+        ...errorFields(error),
+      });
+      await wait(retryDelayMs);
+    }
+  }
+
+  throw new Error("Forwarded marker retry loop ended unexpectedly");
+}
+
+async function writeStateWithRetry(
+  kv: KVNamespace,
+  key: string,
+  value: string,
+  logContext: LogContext,
+  stateKind: string,
+  options?: { expirationTtl?: number },
+): Promise<number> {
+  for (let attempt = 1; attempt <= STATE_WRITE_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await kv.put(key, value, options);
+      return attempt;
+    } catch (error) {
+      if (attempt === STATE_WRITE_MAX_ATTEMPTS) {
+        throw error;
+      }
+
+      const retryDelayMs = Math.min(
+        STATE_WRITE_INITIAL_DELAY_MS * 2 ** (attempt - 1),
+        STATE_WRITE_MAX_DELAY_MS,
+      );
+      logWarning("state_write_retry", logContext, {
+        dependency: "cloudflare-kv",
+        stateKind,
+        failedAttempt: attempt,
+        nextAttempt: attempt + 1,
+        maxAttempts: STATE_WRITE_MAX_ATTEMPTS,
+        retryDelayMs,
+        ...errorFields(error),
+      });
+      await wait(retryDelayMs);
+    }
+  }
+
+  throw new Error("State write retry loop ended unexpectedly");
 }
 
 function utcDate(): string {
@@ -124,6 +249,7 @@ async function findUnprocessedMessages(
   kv: KVNamespace,
   limit: number,
   maximumScan: number,
+  requestOptions: GmailRequestOptions,
 ): Promise<CandidateSearchResult> {
   const messages: GmailMessageReference[] = [];
   const seen = new Set<string>();
@@ -138,9 +264,7 @@ async function findUnprocessedMessages(
       return [];
     }
 
-    const markerKeys = pageMessages.map((message) =>
-      processedKey(message.id),
-    );
+    const markerKeys = pageMessages.map((message) => processedKey(message.id));
     const markers = await kv.get(markerKeys);
     const unprocessed: GmailMessageReference[] = [];
 
@@ -170,7 +294,7 @@ async function findUnprocessedMessages(
 
   const firstPageSize = Math.min(KV_BULK_READ_LIMIT, maximumScan);
   const [firstPage, storedCursorValue] = await Promise.all([
-    listInboxMessages(accessToken, firstPageSize),
+    listInboxMessages(accessToken, firstPageSize, undefined, requestOptions),
     kv.get(INBOX_CURSOR_KEY),
   ]);
   const storedCursor =
@@ -198,13 +322,14 @@ async function findUnprocessedMessages(
   while (pageToken !== undefined && scanned < maximumScan) {
     const currentPageToken = pageToken;
     const pageSize = Math.min(KV_BULK_READ_LIMIT, maximumScan - scanned);
-    let page;
+    let page: GmailMessagePage;
 
     try {
       page = await listInboxMessages(
         accessToken,
         pageSize,
         currentPageToken,
+        requestOptions,
       );
     } catch (error) {
       if (
@@ -225,9 +350,7 @@ async function findUnprocessedMessages(
     scanned += page.messages.length;
     const pageUnprocessed = await unprocessedIn(page.messages);
     if (pageUnprocessed.length > 0) {
-      messages.push(
-        ...pageUnprocessed.slice(0, limit - messages.length),
-      );
+      messages.push(...pageUnprocessed.slice(0, limit - messages.length));
 
       if (currentPageToken !== storedCursor) {
         cursorToSave = currentPageToken;
@@ -242,10 +365,7 @@ async function findUnprocessedMessages(
     }
   }
 
-  if (
-    firstPage.messages.length === 0 &&
-    storedCursor !== undefined
-  ) {
+  if (firstPage.messages.length === 0 && storedCursor !== undefined) {
     cursorToSave = INBOX_CURSOR_START;
   }
 
@@ -276,9 +396,8 @@ function gmailCredentials(config: FanoutConfig) {
 
 function messageSubject(payload: GmailMessagePart): string {
   return subjectForLog(
-    payload.headers?.find(
-      (header) => header.name?.toLowerCase() === "subject",
-    )?.value,
+    payload.headers?.find((header) => header.name?.toLowerCase() === "subject")
+      ?.value,
   );
 }
 
@@ -286,18 +405,54 @@ export async function runMailFanout(
   env: Env,
   logContext: LogContext,
 ): Promise<FanoutResult> {
-  const config = synchronousRunStage("configuration", () =>
-    loadConfig(env),
-  );
-  const accessToken = await runStage("oauth_refresh", () =>
-    refreshAccessToken(gmailCredentials(config)),
-  );
+  const config = synchronousRunStage("configuration", () => loadConfig(env));
+  const gmailRequestOptions: GmailRequestOptions = {
+    onRetry(event) {
+      logWarning("http_request_retry", logContext, {
+        dependency: "gmail",
+        operation: event.operation,
+        failedAttempt: event.attempt,
+        nextAttempt: event.nextAttempt,
+        retryDelayMs: event.delayMs,
+        reason: event.reason,
+        httpStatus: event.status,
+      });
+    },
+  };
+  let accessToken: string;
+  try {
+    accessToken = await refreshAccessToken(
+      gmailCredentials(config),
+      gmailRequestOptions,
+    );
+  } catch (error) {
+    const oauthError =
+      error instanceof GmailOAuthError
+        ? {
+            oauthErrorCode: error.code,
+            recoveryAction: error.recovery,
+            requiresOperatorAction: error.requiresOperatorAction,
+            retryExpected: !error.requiresOperatorAction,
+            httpStatus: error.status,
+          }
+        : {
+            oauthErrorCode: "transport_or_unknown_error",
+            recoveryAction: "retry_automatically",
+            requiresOperatorAction: false,
+            retryExpected: true,
+          };
+    logError("oauth_refresh_failed", logContext, {
+      processingStage: "oauth_refresh",
+      ...oauthError,
+      ...errorFields(error),
+    });
+    throw new FanoutRunError("oauth_refresh", error);
+  }
   const authenticatedAddress = await runStage("gmail_profile", () =>
-    getAuthenticatedAddress(accessToken),
+    getAuthenticatedAddress(accessToken, gmailRequestOptions),
   );
   if (
-    authenticatedAddress.toLowerCase() !==
-    config.gmailAddress.toLowerCase()
+    authenticatedAddress.toLowerCase() !== config.gmailAddress.toLowerCase()
   ) {
     throw new FanoutRunError(
       "gmail_profile_validation",
@@ -343,18 +498,22 @@ export async function runMailFanout(
       env.PROCESSED_EMAILS,
       config.maxMessagesPerRun,
       config.maxInboxScanPerRun,
+      gmailRequestOptions,
     ),
   );
   if (candidates.cursorToSave !== undefined) {
     const cursorToSave = candidates.cursorToSave;
     await runStage("inbox_cursor_write", () =>
-      env.PROCESSED_EMAILS.put(INBOX_CURSOR_KEY, cursorToSave),
+      writeStateWithRetry(
+        env.PROCESSED_EMAILS,
+        INBOX_CURSOR_KEY,
+        cursorToSave,
+        logContext,
+        "inbox_cursor",
+      ),
     );
     logInfo("inbox_cursor_saved", logContext, {
-      cursorState:
-        cursorToSave === INBOX_CURSOR_START
-          ? "start"
-          : "resume",
+      cursorState: cursorToSave === INBOX_CURSOR_START ? "start" : "resume",
     });
   }
   logInfo("inbox_scan_completed", logContext, {
@@ -380,24 +539,33 @@ export async function runMailFanout(
     let processingStage = "message_content_download";
     let subject = "(unavailable)";
     let matchSource: RequiredContentMatch | undefined;
+    let markerWriteAttempts: number | undefined;
     let sentMessageId: string | undefined;
 
     try {
-      const payload = await getMessageContent(accessToken, message.id);
+      const payload = await getMessageContent(
+        accessToken,
+        message.id,
+        gmailRequestOptions,
+      );
       subject = messageSubject(payload);
       processingStage = "content_filter";
       matchSource = await findRequiredContentMatch(
         accessToken,
         message.id,
         payload,
+        gmailRequestOptions,
       );
       evaluated += 1;
 
       if (matchSource === undefined) {
         processingStage = "filtered_marker_write";
-        await env.PROCESSED_EMAILS.put(
+        markerWriteAttempts = await writeStateWithRetry(
+          env.PROCESSED_EMAILS,
           processedKey(message.id),
           FILTERED_MARKER,
+          logContext,
+          "filtered_marker",
         );
         filtered += 1;
         logInfo("message_filtered", logContext, {
@@ -409,6 +577,7 @@ export async function runMailFanout(
           previousState: "unprocessed",
           nextState: "filtered",
           markerStored: true,
+          markerWriteAttempts,
           durationMs: elapsedMilliseconds(messageStartedAt),
         });
         continue;
@@ -431,7 +600,11 @@ export async function runMailFanout(
       }
 
       processingStage = "raw_message_download";
-      const raw = await getRawMessage(accessToken, message.id);
+      const raw = await getRawMessage(
+        accessToken,
+        message.id,
+        gmailRequestOptions,
+      );
       processingStage = "message_encoding";
       const outgoing = createForwardMessage({
         raw,
@@ -447,13 +620,20 @@ export async function runMailFanout(
         matchSource,
         currentState: "unprocessed",
       });
-      sentMessageId = await sendRawMessage(accessToken, outgoing);
+      sentMessageId = await sendRawMessage(
+        accessToken,
+        outgoing,
+        gmailRequestOptions,
+      );
       sent += 1;
 
       processingStage = "forwarded_marker_write";
-      await env.PROCESSED_EMAILS.put(
+      markerWriteAttempts = await writeForwardedMarkerWithRetry(
+        env.PROCESSED_EMAILS,
         processedKey(message.id),
-        FORWARDED_MARKER,
+        logContext,
+        message.id,
+        subject,
       );
       forwarded += 1;
       logInfo("message_forwarded", logContext, {
@@ -461,24 +641,36 @@ export async function runMailFanout(
         subject,
         sentMessageId,
         outcome: "forwarded",
+        deliveryState: "accepted_by_gmail",
+        deliverySemantics: "at_least_once",
         previousState: "unprocessed",
         nextState: "forwarded",
         markerStored: true,
+        markerWriteAttempts,
         recipientCount: config.recipients.length,
         matchSource,
         durationMs: elapsedMilliseconds(messageStartedAt),
       });
     } catch (error) {
       failed += 1;
+      const originalError =
+        error instanceof ForwardedMarkerWriteError
+          ? error.originalError
+          : error;
       const sentWithoutMarker =
         sentMessageId !== undefined &&
         processingStage === "forwarded_marker_write";
-      const stopsRun = shouldStopAfter(error);
+      const deliveryUncertain =
+        originalError instanceof GmailDeliveryUncertainError;
+      const duplicateRisk = sentWithoutMarker || deliveryUncertain;
+      const stopsRun = shouldStopAfter(originalError);
 
       logError(
         sentWithoutMarker
           ? "message_sent_without_marker"
-          : "message_processing_failed",
+          : deliveryUncertain
+            ? "message_delivery_uncertain"
+            : "message_processing_failed",
         logContext,
         {
           messageId: message.id,
@@ -489,22 +681,32 @@ export async function runMailFanout(
           currentState: "unprocessed",
           markerStored: false,
           retryExpected: true,
-          duplicateRisk: sentWithoutMarker,
+          duplicateRisk,
           stopsRun,
+          markerWriteAttempts:
+            error instanceof ForwardedMarkerWriteError
+              ? error.attempts
+              : markerWriteAttempts,
           matchSource,
           gmailStatus:
-            error instanceof GmailApiError ? error.status : undefined,
+            originalError instanceof GmailApiError
+              ? originalError.status
+              : originalError instanceof GmailDeliveryUncertainError
+                ? originalError.status
+                : undefined,
           durationMs: elapsedMilliseconds(messageStartedAt),
-          ...errorFields(error),
+          ...errorFields(originalError),
         },
       );
 
-      if (sentWithoutMarker) {
+      if (duplicateRisk) {
         logWarning("duplicate_delivery_risk", logContext, {
           messageId: message.id,
           subject,
           sentMessageId,
-          reason: "gmail_send_succeeded_but_kv_marker_failed",
+          reason: sentWithoutMarker
+            ? "gmail_send_succeeded_but_kv_marker_failed"
+            : "gmail_send_result_uncertain",
         });
       }
 
@@ -517,9 +719,16 @@ export async function runMailFanout(
   if (sent > 0) {
     const updatedUsage = usage + sent * config.recipients.length;
     await runStage("daily_quota_write", () =>
-      env.PROCESSED_EMAILS.put(usageKey, String(updatedUsage), {
-        expirationTtl: DAILY_USAGE_TTL_SECONDS,
-      }),
+      writeStateWithRetry(
+        env.PROCESSED_EMAILS,
+        usageKey,
+        String(updatedUsage),
+        logContext,
+        "daily_delivery_usage",
+        {
+          expirationTtl: DAILY_USAGE_TTL_SECONDS,
+        },
+      ),
     );
     logInfo("delivery_quota_updated", logContext, {
       previousDeliveryUsage: usage,

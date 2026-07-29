@@ -1,10 +1,18 @@
+import { fetchWithPolicy, type HttpRetryEvent } from "./http";
+
 const GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const GMAIL_HTTP_TIMEOUT_MS = 20_000;
+const SAFE_REQUEST_MAX_ATTEMPTS = 3;
 
 export interface GmailCredentials {
   readonly clientId: string;
   readonly clientSecret: string;
   readonly refreshToken: string;
+}
+
+export interface GmailRequestOptions {
+  readonly onRetry?: (event: HttpRetryEvent) => void;
 }
 
 export interface GmailMessageReference {
@@ -80,6 +88,55 @@ export class GmailApiError extends Error {
   }
 }
 
+export type GmailOAuthRecovery =
+  | "reauthorize_gmail"
+  | "repair_oauth_client"
+  | "retry_automatically";
+
+const REAUTHORIZATION_ERRORS = new Set(["access_denied", "invalid_grant"]);
+const CLIENT_CONFIGURATION_ERRORS = new Set([
+  "deleted_client",
+  "invalid_client",
+  "invalid_scope",
+  "unauthorized_client",
+  "unsupported_grant_type",
+]);
+
+export class GmailOAuthError extends Error {
+  readonly recovery: GmailOAuthRecovery;
+
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    details: string,
+  ) {
+    super(`Gmail OAuth token refresh failed (${code}): ${details}`);
+    this.name = "GmailOAuthError";
+    this.recovery = REAUTHORIZATION_ERRORS.has(code)
+      ? "reauthorize_gmail"
+      : CLIENT_CONFIGURATION_ERRORS.has(code)
+        ? "repair_oauth_client"
+        : "retry_automatically";
+  }
+
+  get requiresOperatorAction(): boolean {
+    return this.recovery !== "retry_automatically";
+  }
+}
+
+export class GmailDeliveryUncertainError extends Error {
+  readonly status?: number;
+
+  constructor(readonly originalError: unknown) {
+    super(
+      "Gmail message delivery could not be confirmed; the request may have succeeded",
+    );
+    this.name = "GmailDeliveryUncertainError";
+    this.status =
+      originalError instanceof GmailApiError ? originalError.status : undefined;
+  }
+}
+
 function errorDetails(value: string): string {
   return value.replace(/\s+/g, " ").trim().slice(0, 500);
 }
@@ -89,28 +146,49 @@ async function gmailRequest<T>(
   operation: string,
   url: string,
   init?: RequestInit,
+  options?: GmailRequestOptions,
+  maxAttempts = SAFE_REQUEST_MAX_ATTEMPTS,
 ): Promise<T> {
   const headers = new Headers(init?.headers);
   headers.set("Authorization", `Bearer ${accessToken}`);
 
-  const response = await fetch(url, {
-    ...init,
-    headers,
-  });
+  const response = await fetchWithPolicy(
+    url,
+    {
+      ...init,
+      headers,
+    },
+    {
+      operation: `Gmail ${operation}`,
+      timeoutMs: GMAIL_HTTP_TIMEOUT_MS,
+      maxAttempts,
+      onRetry: options?.onRetry,
+    },
+  );
+  const responseText = await response.text();
 
   if (!response.ok) {
     throw new GmailApiError(
       response.status,
       operation,
-      errorDetails(await response.text()),
+      errorDetails(responseText || response.statusText || "Unknown error"),
     );
   }
 
-  return (await response.json()) as T;
+  try {
+    return JSON.parse(responseText) as T;
+  } catch {
+    throw new GmailApiError(
+      response.status,
+      operation,
+      "Gmail returned an invalid JSON response",
+    );
+  }
 }
 
 export async function refreshAccessToken(
   credentials: GmailCredentials,
+  options?: GmailRequestOptions,
 ): Promise<string> {
   const body = new URLSearchParams({
     client_id: credentials.clientId,
@@ -119,21 +197,41 @@ export async function refreshAccessToken(
     grant_type: "refresh_token",
   });
 
-  const response = await fetch(GOOGLE_TOKEN_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
+  const response = await fetchWithPolicy(
+    GOOGLE_TOKEN_URL,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
     },
-    body,
-  });
+    {
+      operation: "Gmail OAuth token refresh",
+      timeoutMs: GMAIL_HTTP_TIMEOUT_MS,
+      maxAttempts: SAFE_REQUEST_MAX_ATTEMPTS,
+      onRetry: options?.onRetry,
+    },
+  );
+  const responseText = await response.text();
+  let result: TokenResponse;
 
-  const result = (await response.json()) as TokenResponse;
-  if (!response.ok || result.access_token === undefined) {
-    const details =
-      result.error_description ?? result.error ?? "No access token returned";
+  try {
+    result = JSON.parse(responseText) as TokenResponse;
+  } catch {
     throw new GmailApiError(
       response.status,
       "OAuth token refresh",
+      "Google returned an invalid JSON response",
+    );
+  }
+
+  if (!response.ok || result.access_token === undefined) {
+    const details =
+      result.error_description ?? result.error ?? "No access token returned";
+    throw new GmailOAuthError(
+      response.status,
+      result.error ?? "invalid_token_response",
       errorDetails(details),
     );
   }
@@ -145,6 +243,7 @@ export async function listInboxMessages(
   accessToken: string,
   maxResults: number,
   pageToken?: string,
+  options?: GmailRequestOptions,
 ): Promise<GmailMessagePage> {
   const parameters = new URLSearchParams({
     labelIds: "INBOX",
@@ -163,6 +262,8 @@ export async function listInboxMessages(
     accessToken,
     "inbox listing",
     `${GMAIL_API_BASE}/messages?${parameters.toString()}`,
+    undefined,
+    options,
   );
 
   return {
@@ -173,15 +274,20 @@ export async function listInboxMessages(
 
 export async function getAuthenticatedAddress(
   accessToken: string,
+  options?: GmailRequestOptions,
 ): Promise<string> {
   const result = await gmailRequest<ProfileResponse>(
     accessToken,
     "profile lookup",
     `${GMAIL_API_BASE}/profile`,
+    undefined,
+    options,
   );
 
   if (result.emailAddress === undefined) {
-    throw new Error("Gmail did not return an address for the authenticated user");
+    throw new Error(
+      "Gmail did not return an address for the authenticated user",
+    );
   }
 
   return result.emailAddress;
@@ -190,11 +296,14 @@ export async function getAuthenticatedAddress(
 export async function getRawMessage(
   accessToken: string,
   messageId: string,
+  options?: GmailRequestOptions,
 ): Promise<string> {
   const result = await gmailRequest<RawMessageResponse>(
     accessToken,
     "message download",
     `${GMAIL_API_BASE}/messages/${encodeURIComponent(messageId)}?format=raw`,
+    undefined,
+    options,
   );
 
   if (result.raw === undefined) {
@@ -207,11 +316,14 @@ export async function getRawMessage(
 export async function getMessageContent(
   accessToken: string,
   messageId: string,
+  options?: GmailRequestOptions,
 ): Promise<GmailMessagePart> {
   const result = await gmailRequest<FullMessageResponse>(
     accessToken,
     "message content download",
     `${GMAIL_API_BASE}/messages/${encodeURIComponent(messageId)}?format=full`,
+    undefined,
+    options,
   );
 
   if (result.payload === undefined) {
@@ -225,6 +337,7 @@ export async function getMessageAttachment(
   accessToken: string,
   messageId: string,
   attachmentId: string,
+  options?: GmailRequestOptions,
 ): Promise<string> {
   const result = await gmailRequest<AttachmentResponse>(
     accessToken,
@@ -232,12 +345,12 @@ export async function getMessageAttachment(
     `${GMAIL_API_BASE}/messages/${encodeURIComponent(
       messageId,
     )}/attachments/${encodeURIComponent(attachmentId)}`,
+    undefined,
+    options,
   );
 
   if (result.data === undefined) {
-    throw new Error(
-      `Gmail attachment ${attachmentId} did not contain data`,
-    );
+    throw new Error(`Gmail attachment ${attachmentId} did not contain data`);
   }
 
   return result.data;
@@ -246,23 +359,38 @@ export async function getMessageAttachment(
 export async function sendRawMessage(
   accessToken: string,
   raw: string,
+  options?: GmailRequestOptions,
 ): Promise<string> {
-  const result = await gmailRequest<SentMessageResponse>(
-    accessToken,
-    "message send",
-    `${GMAIL_API_BASE}/messages/send`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
+  try {
+    const result = await gmailRequest<SentMessageResponse>(
+      accessToken,
+      "message send",
+      `${GMAIL_API_BASE}/messages/send`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ raw }),
       },
-      body: JSON.stringify({ raw }),
-    },
-  );
+      options,
+      1,
+    );
 
-  if (result.id === undefined) {
-    throw new Error("Gmail did not return an ID for the sent message");
+    if (result.id === undefined) {
+      throw new Error("Gmail did not return an ID for the sent message");
+    }
+
+    return result.id;
+  } catch (error) {
+    if (
+      error instanceof GmailApiError &&
+      error.status !== 408 &&
+      error.status < 500
+    ) {
+      throw error;
+    }
+
+    throw new GmailDeliveryUncertainError(error);
   }
-
-  return result.id;
 }

@@ -1,6 +1,7 @@
 import {
-  getMessageAttachment,
   type GmailMessagePart,
+  type GmailRequestOptions,
+  getMessageAttachment,
 } from "./gmail";
 import { MessageFormatError } from "./message";
 
@@ -10,16 +11,12 @@ const UTF8_DECODER = new TextDecoder();
 
 export type RequiredContentMatch = "subject" | "body";
 
-function subjectContainsRequiredContent(
-  payload: GmailMessagePart,
-): boolean {
+function subjectContainsRequiredContent(payload: GmailMessagePart): boolean {
   const subject = payload.headers?.find(
     (header) => header.name?.toLowerCase() === "subject",
   )?.value;
 
-  return (
-    subject?.toLowerCase().includes(REQUIRED_CONTENT) ?? false
-  );
+  return subject?.toLowerCase().includes(REQUIRED_CONTENT) ?? false;
 }
 
 function decodeBase64Url(value: string): Uint8Array {
@@ -50,10 +47,16 @@ async function partContainsRequiredContent(
   accessToken: string,
   messageId: string,
   part: GmailMessagePart,
+  requestOptions?: GmailRequestOptions,
 ): Promise<boolean> {
   for (const child of part.parts ?? []) {
     if (
-      await partContainsRequiredContent(accessToken, messageId, child)
+      await partContainsRequiredContent(
+        accessToken,
+        messageId,
+        child,
+        requestOptions,
+      )
     ) {
       return true;
     }
@@ -74,6 +77,7 @@ async function partContainsRequiredContent(
       accessToken,
       messageId,
       attachmentId,
+      requestOptions,
     );
   }
 
@@ -90,6 +94,7 @@ export async function findRequiredContentMatch(
   accessToken: string,
   messageId: string,
   payload: GmailMessagePart,
+  requestOptions?: GmailRequestOptions,
 ): Promise<RequiredContentMatch | undefined> {
   if (subjectContainsRequiredContent(payload)) {
     return "subject";
@@ -99,6 +104,7 @@ export async function findRequiredContentMatch(
     accessToken,
     messageId,
     payload,
+    requestOptions,
   ))
     ? "body"
     : undefined;

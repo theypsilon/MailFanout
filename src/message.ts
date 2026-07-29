@@ -145,7 +145,10 @@ function parseMessage(raw: string, maximumBytes: number): ParsedMessage {
 }
 
 function sanitizedHeaderValue(value: string, maximumLength = 768): string {
-  return value.replace(/[\r\n]+/g, " ").trim().slice(0, maximumLength);
+  return value
+    .replace(/[\r\n]+/g, " ")
+    .trim()
+    .slice(0, maximumLength);
 }
 
 function subjectHeader(value: string): string {
@@ -179,9 +182,7 @@ function replyAddress(headers: Map<string, string[]>): string | undefined {
     /[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/i,
   );
   const address = match?.[0];
-  return address !== undefined && isEmailAddress(address)
-    ? address
-    : undefined;
+  return address !== undefined && isEmailAddress(address) ? address : undefined;
 }
 
 function senderHeader(sender: string, originalSender?: string): string {
@@ -196,9 +197,7 @@ function senderHeader(sender: string, originalSender?: string): string {
   return `"${displayName}" <${sender}>`;
 }
 
-function originalContentHeaders(
-  headers: Map<string, string[]>,
-): string[] {
+function originalContentHeaders(headers: Map<string, string[]>): string[] {
   const result: string[] = [];
 
   for (const [name, values] of headers) {
@@ -226,9 +225,7 @@ export interface ForwardMessageOptions {
   readonly maximumBytes: number;
 }
 
-export function createForwardMessage(
-  options: ForwardMessageOptions,
-): string {
+export function createForwardMessage(options: ForwardMessageOptions): string {
   const message = parseMessage(options.raw, options.maximumBytes);
   const originalSubject =
     firstHeader(message.headers, "subject") ?? "(no subject)";
@@ -258,9 +255,7 @@ export function createForwardMessage(
   const outgoingHeaders = UTF8_ENCODER.encode(
     `${headers.join("\r\n")}\r\n\r\n`,
   );
-  const outgoing = new Uint8Array(
-    outgoingHeaders.length + message.body.length,
-  );
+  const outgoing = new Uint8Array(outgoingHeaders.length + message.body.length);
   outgoing.set(outgoingHeaders);
   outgoing.set(message.body, outgoingHeaders.length);
 
